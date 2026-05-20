@@ -36,7 +36,13 @@ from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
-from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
+from starVLA.training.trainer_utils.runtime_summary import RuntimeSummary
+from starVLA.training.trainer_utils.trainer_tools import (
+    TrainerUtils,
+    build_param_lr_groups,
+    normalize_dotlist_args,
+    setup_optimizer_and_scheduler,
+)
 
 deepspeed_plugin = DeepSpeedPlugin()
 accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
@@ -115,6 +121,7 @@ class VLATrainer(TrainerUtils):
 
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
+        self.runtime_summary = None
 
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -146,13 +153,13 @@ class VLATrainer(TrainerUtils):
 
         self._init_wandb()
 
+    def _calculate_per_loop_batch_size(self):
+        """Calculate samples consumed by one training-loop iteration."""
+        return self.config.datasets.vla_data.per_device_batch_size * self.accelerator.num_processes
+
     def _calculate_total_batch_size(self):
         """Calculate global batch size."""
-        return (
-            self.config.datasets.vla_data.per_device_batch_size
-            * self.accelerator.num_processes
-            * self.accelerator.gradient_accumulation_steps
-        )
+        return self._calculate_per_loop_batch_size() * self.accelerator.gradient_accumulation_steps
 
     def _init_wandb(self):
         """Initialize Weights & Biases."""
@@ -300,6 +307,13 @@ class VLATrainer(TrainerUtils):
             initial=self.completed_steps,
             disable=not self.accelerator.is_local_main_process,
         )
+        self.runtime_summary = RuntimeSummary(
+            output_dir=self.config.output_dir,
+            per_loop_batch_size=self._calculate_per_loop_batch_size(),
+            total_batch_size=self.total_batch_size,
+            world_size=self.accelerator.num_processes,
+            gradient_accumulation_steps=self.accelerator.gradient_accumulation_steps,
+        )
 
         while self.completed_steps < self.config.trainer.max_train_steps:
             t_start_data = time.perf_counter()
@@ -325,8 +339,11 @@ class VLATrainer(TrainerUtils):
             if self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
 
-            step_metrics["timing/data"] = t_end_data - t_start_data
-            step_metrics["timing/model"] = t_end_model - t_start_model
+            data_time = t_end_data - t_start_data
+            model_time = t_end_model - t_start_model
+            step_metrics["timing/data"] = data_time
+            step_metrics["timing/model"] = model_time
+            self.runtime_summary.record_step(data_time=data_time, model_time=model_time)
             self._log_metrics(step_metrics)
 
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
@@ -409,6 +426,10 @@ class VLATrainer(TrainerUtils):
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
+
+            if self.runtime_summary is not None:
+                summary_path = self.runtime_summary.write(completed_steps=self.completed_steps)
+                logger.info(f"Runtime summary saved at {summary_path}")
 
         if self.accelerator.is_main_process:
             wandb.finish()
