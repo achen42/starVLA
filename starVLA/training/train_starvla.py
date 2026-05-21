@@ -36,7 +36,7 @@ from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
-from starVLA.training.trainer_utils.runtime_summary import RuntimeSummary
+from starVLA.training.trainer_utils.runtime_summary import RuntimeSummary, timed_section
 from starVLA.training.trainer_utils.trainer_tools import (
     TrainerUtils,
     build_param_lr_groups,
@@ -122,6 +122,7 @@ class VLATrainer(TrainerUtils):
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
         self.runtime_summary = None
+        self.runtime_setup_times = {}
 
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -302,17 +303,25 @@ class VLATrainer(TrainerUtils):
         """Execute training loop."""
         self._log_training_config()
         self._create_data_iterators()
+        runtime_summary_cfg = self.config.trainer.get("runtime_summary", {})
+        runtime_summary_enabled = runtime_summary_cfg.get("enabled", True)
+        if runtime_summary_enabled:
+            self.runtime_summary = RuntimeSummary(
+                output_dir=self.config.output_dir,
+                per_loop_batch_size=self._calculate_per_loop_batch_size(),
+                total_batch_size=self.total_batch_size,
+                world_size=self.accelerator.num_processes,
+                gradient_accumulation_steps=self.accelerator.gradient_accumulation_steps,
+                output_basename=runtime_summary_cfg.get("output_basename", "runtime_summary"),
+            )
+            for name, duration in self.runtime_setup_times.items():
+                self.runtime_summary.record_setup_time(name, duration)
+            self.runtime_summary.mark_train_loop_start()
+
         progress_bar = tqdm(
             total=self.config.trainer.max_train_steps,
             initial=self.completed_steps,
             disable=not self.accelerator.is_local_main_process,
-        )
-        self.runtime_summary = RuntimeSummary(
-            output_dir=self.config.output_dir,
-            per_loop_batch_size=self._calculate_per_loop_batch_size(),
-            total_batch_size=self.total_batch_size,
-            world_size=self.accelerator.num_processes,
-            gradient_accumulation_steps=self.accelerator.gradient_accumulation_steps,
         )
 
         while self.completed_steps < self.config.trainer.max_train_steps:
@@ -343,7 +352,8 @@ class VLATrainer(TrainerUtils):
             model_time = t_end_model - t_start_model
             step_metrics["timing/data"] = data_time
             step_metrics["timing/model"] = model_time
-            self.runtime_summary.record_step(data_time=data_time, model_time=model_time)
+            if self.runtime_summary is not None:
+                self.runtime_summary.record_step(data_time=data_time, model_time=model_time)
             self._log_metrics(step_metrics)
 
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
@@ -351,6 +361,9 @@ class VLATrainer(TrainerUtils):
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
                 break
+
+        if self.runtime_summary is not None:
+            self.runtime_summary.mark_train_loop_end()
 
         self._finalize_training()
 
@@ -428,8 +441,8 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
             if self.runtime_summary is not None:
-                summary_path = self.runtime_summary.write(completed_steps=self.completed_steps)
-                logger.info(f"Runtime summary saved at {summary_path}")
+                json_path, csv_path = self.runtime_summary.write(completed_steps=self.completed_steps)
+                logger.info(f"Runtime summary saved at {json_path} and {csv_path}")
 
         if self.accelerator.is_main_process:
             wandb.finish()
@@ -444,9 +457,16 @@ def main(cfg) -> None:
     logger.info("✅ Configuration wrapped for access tracking")
 
     output_dir = setup_directories(cfg=cfg)
-    vla = build_framework(cfg)
-    vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
-    optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
+    runtime_setup_times = {}
+
+    with timed_section(runtime_setup_times, "model_build"):
+        vla = build_framework(cfg)
+
+    with timed_section(runtime_setup_times, "data_prepare"):
+        vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+
+    with timed_section(runtime_setup_times, "optimizer_build"):
+        optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLATrainer(
         cfg=cfg,
@@ -457,7 +477,10 @@ def main(cfg) -> None:
         accelerator=accelerator,
     )
 
-    trainer.prepare_training()
+    trainer.runtime_setup_times.update(runtime_setup_times)
+
+    with timed_section(trainer.runtime_setup_times, "trainer_prepare"):
+        trainer.prepare_training()
     trainer.train()
 
     logger.info("... and that's all, folks!")
